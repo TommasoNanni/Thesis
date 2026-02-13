@@ -4,3 +4,4 @@ test_outputs/
 Grounded-SAM-2/
 *.pyc
 __pycache__/
+slahmr/

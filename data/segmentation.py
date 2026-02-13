@@ -170,10 +170,6 @@ class PersonSegmenter:
             video_results[video.video_id] = result
             global_objects_count = result["objects_count"]
 
-            if vis:
-                print(f"  Generating local-ID visualization for {video.video_id}...")
-                self._visualize(video, vid_out, suffix="_local") # Aggiungi un suffisso
-                
             del result
             gc.collect()
             torch.cuda.empty_cache()
