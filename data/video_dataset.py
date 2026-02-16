@@ -19,6 +19,7 @@ decoded on demand — one at a time, in slices, or in batches.
 from __future__ import annotations
 
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import tqdm
 
@@ -57,7 +58,8 @@ class Video:
         # (important for DataLoader with num_workers > 0).
         vr = self._make_reader()
         self.num_frames: int = len(vr)
-        self.shift: int | None = None
+        self.start: int = 0
+        self.end: int = self.num_frames
         self.fps: float = float(vr.get_avg_fps())
         # Get resolution from container metadata — no frame decoding needed.
         self.original_w, self.original_h = vr[0].shape[1], vr[0].shape[0]
@@ -160,49 +162,50 @@ class Scene:
     def __iter__(self):
         return iter(self.videos)
 
-    def shuffle(self, max_shift: int = 30) -> dict[str, int]:
-        """Apply a random temporal shift to each video in this scene.
+    def shuffle(self, max_shift: int = 30) -> dict[str, tuple[int, int]]:
+        """Apply random temporal cropping to each video in this scene.
 
-        Each video gets a random offset in [-max_shift, +max_shift] frames,
-        clamped so indices stay within [0, num_frames).  The shifts are stored
-        on each ``Video`` object as ``video.shift`` and also returned as a dict.
+        Each video gets a random start point in [0, max_shift] and a random
+        end point in [T - max_shift, T], where T is the total number of
+        frames.  The effective frame range becomes [start, end).
 
         Parameters
         ----------
         max_shift : int
-            Maximum absolute frame shift (in either direction).
+            Maximum shift for start/end boundaries.
 
         Returns
         -------
-        dict mapping video_id -> applied shift (int).
+        dict mapping video_id -> (start, end).
         """
         shifts = {}
         for video in self.videos:
-            shift = random.randint(-max_shift, max_shift)
-            video.shift = shift
-            shifts[video.video_id] = shift
+            start = random.randint(0, min(max_shift, video.num_frames - 1))
+            end = random.randint(max(video.num_frames - max_shift, start + 1), video.num_frames)
+            video.start = start
+            video.end = end
+            shifts[video.video_id] = (start, end)
         return shifts
 
     def get_shifted_frame(self, video_key: int | str, t: int) -> torch.Tensor:
-        """Get frame *t* from a video, accounting for its current shift.
+        """Get frame *t* from a video, remapped to its [start, end) range.
 
-        Actual decoded index = t + video.shift, clamped to valid range.
+        *t* is treated as a normalised index into the cropped range:
+        actual_index = start + t, clamped to [start, end - 1].
         Returns (C, H, W) uint8.
         """
         video = self[video_key]
-        shift = getattr(video, "shift", 0)
-        idx = min(max(t + shift, 0), video.num_frames - 1)
+        idx = min(max(video.start + t, video.start), video.end - 1)
         return video[idx]
 
     def get_shifted_batch(self, video_key: int | str,
                           indices: list[int]) -> torch.Tensor:
-        """Get multiple frames from a video with shift applied.
+        """Get multiple frames from a video, remapped to its [start, end) range.
 
         Returns (T, C, H, W) uint8.
         """
         video = self[video_key]
-        shift = getattr(video, "shift", 0)
-        shifted = [min(max(t + shift, 0), video.num_frames - 1) for t in indices]
+        shifted = [min(max(video.start + t, video.start), video.end - 1) for t in indices]
         return video.get_batch(shifted)
 
     def __repr__(self) -> str:
@@ -257,13 +260,40 @@ class EgoExoSceneDataset(Dataset):
                 f"No scene folders with videos found under {self.data_root}"
             )
 
-        self.scenes: list[Scene] = []
-        for scene_dir in tqdm.tqdm(scene_dirs, desc="Loading scenes"):
-            videos = [
-                Video(p, resolution=self.resolution)
-                for p in self._list_videos(scene_dir)
-                if not (self.exclude_ego and p.stem.startswith("aria")) and not p.stem.startswith("ego_preview")
+        # Collect all (scene_dir, video_path) pairs for parallel loading.
+        scene_video_paths: list[tuple[Path, list[Path]]] = []
+        for scene_dir in scene_dirs:
+            vid_paths = [
+                p for p in self._list_videos(scene_dir)
+                if not (self.exclude_ego and p.stem.startswith("aria"))
+                and not p.stem.startswith("ego_preview")
             ]
+            scene_video_paths.append((scene_dir, vid_paths))
+
+        total_videos = sum(len(vps) for _, vps in scene_video_paths)
+        print(f"Loading metadata for {total_videos} videos across {len(scene_dirs)} scenes...")
+
+        # Load all Video objects in parallel using threads (I/O-bound).
+        # Maps video_path -> Video object.
+        all_video_paths = [
+            vp for _, vps in scene_video_paths for vp in vps
+        ]
+        video_map: dict[Path, Video] = {}
+        with ThreadPoolExecutor(max_workers=min(32, len(all_video_paths) or 1)) as pool:
+            futures = {
+                pool.submit(Video, p, self.resolution): p
+                for p in all_video_paths
+            }
+            for future in tqdm.tqdm(
+                as_completed(futures), total=len(futures), desc="Loading videos"
+            ):
+                path = futures[future]
+                video_map[path] = future.result()
+
+        # Assemble scenes in the original order.
+        self.scenes: list[Scene] = []
+        for scene_dir, vid_paths in scene_video_paths:
+            videos = [video_map[p] for p in vid_paths]
             self.scenes.append(Scene(scene_id=scene_dir.name, videos=videos))
 
         print(f"Dataset created: {len(self.scenes)} scenes, "
@@ -303,24 +333,25 @@ if __name__ =="__main__":
     for v in scene:
         print(f"  {v}\n")
 
-    # Test shuffle: apply random temporal shifts
+    # Test shuffle: apply random temporal cropping
     print("\n--- Testing shuffle ---")
     shifts = scene.shuffle(max_shift=30)
-    for vid_id, s in shifts.items():
-        print(f"  {vid_id}: shift={s}")
+    for vid_id, (s, e) in shifts.items():
+        print(f"  {vid_id}: start={s}, end={e}")
 
     # Verify shifts are stored on the Video objects
     for v in scene:
-        assert v.shift == shifts[v.video_id], f"Shift mismatch for {v.video_id}"
+        s, e = shifts[v.video_id]
+        assert v.start == s and v.end == e, f"Shift mismatch for {v.video_id}"
     print("  All shifts stored correctly on Video objects.")
 
     # Test shifted frame access
     video = scene[0]
     t = 50
-    frame_normal = video[t]
+    frame_normal = video[video.start + t]
     frame_shifted = scene.get_shifted_frame(0, t)
-    print(f"\n--- Shifted frame access (t={t}, shift={video.shift}) ---")
-    print(f"  video[{t}]             -> shape={frame_normal.shape}")
+    print(f"\n--- Shifted frame access (t={t}, start={video.start}, end={video.end}) ---")
+    print(f"  video[start+{t}]        -> shape={frame_normal.shape}")
     print(f"  get_shifted_frame(0,{t}) -> shape={frame_shifted.shape}")
     same = torch.equal(frame_normal, frame_shifted)
-    print(f"  Frames identical: {same} (expected {video.shift == 0})")
+    print(f"  Frames identical: {same} (expected True)")

@@ -29,6 +29,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+import torch.multiprocessing as mp
 from PIL import Image
 from tqdm import tqdm
 
@@ -38,6 +39,8 @@ from sam2.gdsam2_utils.mask_dictionary_model import MaskDictionaryModel, ObjectI
 from sam2.gdsam2_utils.common_utils import CommonUtils
 from sam2.gdsam2_utils.video_utils import create_video_from_images
 from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+
+from decord import VideoReader, cpu
 
 from data.video_dataset import Scene, Video
 
@@ -129,14 +132,29 @@ class PersonSegmenter:
         self._models_ready = True
         print(f"PersonSegmenter: models loaded on {self.device}")
 
+    def _free_models(self) -> None:
+        """Release GPU models so child processes can use the VRAM."""
+        self._video_predictor = None
+        self._image_predictor = None
+        self._gdino_processor = None
+        self._gdino_model = None
+        self._models_ready = False
+        gc.collect()
+        torch.cuda.empty_cache()
+
     def segment_scene(
         self,
         scene: Scene,
         output_dir: str | Path,
         vis: bool = False,
         match_across_videos: bool = True,
+        _objects_count_start: int = 0,
     ) -> dict[str, Path]:
         """Segment every video in *scene* and (optionally) unify IDs.
+
+        Videos are processed **in parallel** across all available GPUs.
+        Each video is assigned to a GPU and runs in its own process with
+        its own model instances.
 
         Parameters
         ----------
@@ -152,27 +170,53 @@ class PersonSegmenter:
 
         Returns
         -------
-        dict mapping ``video_id``  ``Path`` to that video's output folder.
+        dict mapping ``video_id`` → ``Path`` to that video's output folder.
         """
-        if not self._models_ready:
-            self._init_models()
-
         scene_dir = Path(output_dir) / scene.scene_id
         scene_dir.mkdir(parents=True, exist_ok=True)
 
-        video_results: dict[str, dict] = {}
-        global_objects_count = 0
+        num_gpus = torch.cuda.device_count()
+        num_videos = len(scene.videos)
 
-        # --- per-video segmentation ---
-        for video in tqdm(scene.videos, desc=f"Segmenting {scene.scene_id}"):
+        if num_gpus <= 1:
+            return self._segment_scene_sequential(
+                scene, output_dir, vis, match_across_videos, _objects_count_start
+            )
+
+        print(f"Parallel segmentation: {num_videos} videos across {num_gpus} GPUs")
+
+        # Build worker arguments — each video gets a GPU (round-robin)
+        # and a large ID offset so person IDs don't collide.
+        worker_args = []
+        for vi, video in enumerate(scene.videos):
+            gpu_id = vi % num_gpus
             vid_out = scene_dir / video.video_id
-            result = self._segment_video(video, vid_out, global_objects_count)
-            video_results[video.video_id] = result
-            global_objects_count = result["objects_count"]
+            worker_args.append((
+                gpu_id,
+                str(video.path),
+                video.video_id,
+                str(vid_out),
+                _objects_count_start + vi * 10000,
+                self.sam2_checkpoint,
+                self.model_cfg,
+                self.gdino_model_id,
+                self.text_prompt,
+                self.box_threshold,
+                self.text_threshold,
+                self.detection_step,
+            ))
 
-            del result
-            gc.collect()
-            torch.cuda.empty_cache()
+        # Free the main-process models before spawning children
+        self._free_models()
+
+        mp.set_start_method("spawn", force=True)
+        with mp.Pool(processes=min(num_gpus, num_videos)) as pool:
+            results = pool.starmap(PersonSegmenter._segment_video_on_gpu, worker_args)
+
+        # Rebuild video_results from worker outputs, now everything returns sequential
+        video_results: dict[str, dict] = {}
+        for r in results:
+            video_results[r["video_id"]] = r
 
         # --- cross-video ID matching ---
         if match_across_videos and len(scene.videos) > 1:
@@ -198,6 +242,289 @@ class PersonSegmenter:
                 shutil.rmtree(frame_dir)
                 print(f"Removed {frame_dir}")
 
+    # ------------------------------------------------------------------
+    # Sequential fallback (single GPU)
+    # ------------------------------------------------------------------
+
+    def _segment_scene_sequential(
+        self,
+        scene: Scene,
+        output_dir: str | Path,
+        vis: bool = False,
+        match_across_videos: bool = True,
+        objects_count_start: int = 0,
+    ) -> dict[str, Path]:
+        """Original sequential fallback for single-GPU environments."""
+        if not self._models_ready:
+            self._init_models()
+
+        scene_dir = Path(output_dir) / scene.scene_id
+        scene_dir.mkdir(parents=True, exist_ok=True)
+
+        video_results: dict[str, dict] = {}
+        global_objects_count = objects_count_start
+
+        for video in tqdm(scene.videos, desc=f"Segmenting {scene.scene_id}"):
+            vid_out = scene_dir / video.video_id
+            result = self._segment_video(video, vid_out, global_objects_count)
+            video_results[video.video_id] = result
+            global_objects_count = result["objects_count"]
+
+            del result
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        if match_across_videos and len(scene.videos) > 1:
+            id_mapping = self._match_across_videos(
+                scene, video_results, scene_dir
+            )
+            if id_mapping:
+                self._apply_id_mapping(id_mapping, scene_dir, scene)
+
+        if vis:
+            for video in scene.videos:
+                self._visualize(video, scene_dir / video.video_id)
+
+        return {v.video_id: scene_dir / v.video_id for v in scene.videos}
+
+    # ------------------------------------------------------------------
+    # Parallel GPU worker
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _segment_video_on_gpu(
+        gpu_id: int,
+        video_path: str,
+        video_id: str,
+        output_dir: str,
+        objects_count_start: int,
+        sam2_checkpoint: str,
+        model_cfg: str,
+        gdino_model_id: str,
+        text_prompt: str,
+        box_threshold: float,
+        text_threshold: float,
+        detection_step: int,
+    ) -> dict:
+        """Segment one video on a specific GPU (runs in a child process).
+
+        Loads its own models and uses decord directly for frame extraction
+        (no Video object re-creation needed).
+        """
+        device = f"cuda:{gpu_id}"
+        torch.cuda.set_device(gpu_id)
+
+        if torch.cuda.get_device_properties(gpu_id).major >= 8:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+        # Load models on this GPU
+        video_predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint)
+        sam2_model = build_sam2(model_cfg, sam2_checkpoint, device=device)
+        image_predictor = SAM2ImagePredictor(sam2_model)
+        gdino_processor = AutoProcessor.from_pretrained(gdino_model_id)
+        gdino_model = (
+            AutoModelForZeroShotObjectDetection
+            .from_pretrained(gdino_model_id)
+            .to(device)
+        )
+
+        print(f"  [GPU {gpu_id}] Models loaded for {video_id}")
+
+        # Set up output directories
+        vid_out = Path(output_dir)
+        vid_out.mkdir(parents=True, exist_ok=True)
+        mask_data_dir = vid_out / "mask_data"
+        json_data_dir = vid_out / "json_data"
+        mask_data_dir.mkdir(exist_ok=True)
+        json_data_dir.mkdir(exist_ok=True)
+
+        # Extract frames directly with decord (no Video object needed)
+        frame_dir = vid_out / "frames"
+        frame_names = PersonSegmenter._extract_frames_from_path(
+            video_path, video_id, frame_dir
+        )
+
+        # Init SAM2 video predictor
+        inference_state = video_predictor.init_state(
+            video_path=str(frame_dir),
+            offload_video_to_cpu=True,
+            offload_state_to_cpu=True,
+            async_loading_frames=False,
+        )
+
+        sam2_masks = MaskDictionaryModel()
+        objects_count = objects_count_start
+        step = detection_step
+
+        print(f"  [GPU {gpu_id}] {video_id}: {len(frame_names)} frames, step={step}")
+
+        for start_idx in range(0, len(frame_names), step):
+            img_path = frame_dir / frame_names[start_idx]
+            image = Image.open(img_path)
+            base_name = frame_names[start_idx].split(".")[0]
+
+            mask_dict = MaskDictionaryModel(
+                promote_type="mask",
+                mask_name=f"mask_{base_name}.npy",
+            )
+
+            # Grounding DINO detection
+            inputs = gdino_processor(
+                images=image, text=text_prompt, return_tensors="pt"
+            ).to(device)
+
+            with torch.no_grad():
+                outputs = gdino_model(**inputs)
+
+            results = gdino_processor.post_process_grounded_object_detection(
+                outputs,
+                inputs.input_ids,
+                threshold=box_threshold,
+                text_threshold=text_threshold,
+                target_sizes=[image.size[::-1]],
+            )
+
+            input_boxes = results[0]["boxes"]
+            labels = results[0]["labels"]
+
+            if input_boxes.shape[0] != 0:
+                image_predictor.set_image(np.array(image.convert("RGB")))
+                masks, scores, logits = image_predictor.predict(
+                    point_coords=None,
+                    point_labels=None,
+                    box=input_boxes,
+                    multimask_output=False,
+                )
+
+                if masks.ndim == 2:
+                    masks = masks[None]
+                    scores = scores[None]
+                    logits = logits[None]
+                elif masks.ndim == 4:
+                    masks = masks.squeeze(1)
+
+                mask_dict.add_new_frame_annotation(
+                    mask_list=torch.tensor(masks).to(device),
+                    box_list=torch.tensor(input_boxes),
+                    label_list=labels,
+                    scores_list=torch.tensor(scores).to(device),
+                )
+
+                objects_count = mask_dict.update_masks(
+                    tracking_annotation_dict=sam2_masks,
+                    iou_threshold=0.8,
+                    objects_count=objects_count,
+                )
+            else:
+                mask_dict = sam2_masks
+
+            if len(mask_dict.labels) == 0:
+                mask_dict.save_empty_mask_and_json(
+                    str(mask_data_dir),
+                    str(json_data_dir),
+                    image_name_list=frame_names[start_idx : start_idx + step],
+                )
+                continue
+
+            # SAM2 video propagation
+            video_predictor.reset_state(inference_state)
+
+            for obj_id, obj_info in mask_dict.labels.items():
+                video_predictor.add_new_mask(
+                    inference_state, start_idx, obj_id, obj_info.mask,
+                )
+
+            video_segments: dict[int, MaskDictionaryModel] = {}
+            for out_frame_idx, out_obj_ids, out_mask_logits in (
+                video_predictor.propagate_in_video(
+                    inference_state,
+                    max_frame_num_to_track=step,
+                    start_frame_idx=start_idx,
+                )
+            ):
+                frame_masks = MaskDictionaryModel()
+                for i, out_obj_id in enumerate(out_obj_ids):
+                    out_mask = out_mask_logits[i] > 0.0
+                    obj_info = ObjectInfo(
+                        instance_id=out_obj_id,
+                        mask=out_mask[0],
+                        class_name=mask_dict.get_target_class_name(out_obj_id),
+                    )
+                    obj_info.update_box()
+                    frame_masks.labels[out_obj_id] = obj_info
+                    frame_masks.mask_name = (
+                        f"mask_{frame_names[out_frame_idx].split('.')[0]}.npy"
+                    )
+                    frame_masks.mask_height = out_mask.shape[-2]
+                    frame_masks.mask_width = out_mask.shape[-1]
+
+                video_segments[out_frame_idx] = frame_masks
+                sam2_masks = copy.deepcopy(frame_masks)
+
+            # Save masks + metadata
+            for frame_idx, fmasks in video_segments.items():
+                mask_img = torch.zeros(fmasks.mask_height, fmasks.mask_width)
+                for obj_id, obj_info in fmasks.labels.items():
+                    mask_img[obj_info.mask == True] = obj_id
+
+                np.save(
+                    str(mask_data_dir / fmasks.mask_name),
+                    mask_img.numpy().astype(np.uint16),
+                )
+                json_path = json_data_dir / fmasks.mask_name.replace(".npy", ".json")
+                with open(json_path, "w") as f:
+                    json.dump(fmasks.to_dict(), f)
+
+        del inference_state, video_predictor, image_predictor, gdino_model, gdino_processor
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        print(f"  [GPU {gpu_id}] {video_id}: done")
+        return {
+            "video_id": video_id,
+            "objects_count": objects_count,
+            "frame_dir": str(frame_dir),
+            "mask_data_dir": str(mask_data_dir),
+            "json_data_dir": str(json_data_dir),
+        }
+
+    @staticmethod
+    def _extract_frames_from_path(
+        video_path: str, video_id: str, frame_dir: Path
+    ) -> list[str]:
+        """Extract frames using decord directly from a video path."""
+        frame_dir.mkdir(parents=True, exist_ok=True)
+
+        existing = sorted(
+            p.name for p in frame_dir.iterdir()
+            if p.suffix.lower() in (".jpg", ".jpeg")
+        )
+        if existing:
+            print(f"  Reusing {len(existing)} existing frames in {frame_dir}")
+            return existing
+
+        vr = VideoReader(video_path, ctx=cpu(0))
+        total = len(vr)
+        frame_names: list[str] = []
+
+        for idx in tqdm(range(total), desc=f"  Extracting {video_id}", leave=False):
+            frame_np = vr[idx].asnumpy()
+            name = f"{idx:06d}.jpg"
+            cv2.imwrite(
+                str(frame_dir / name),
+                cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR),
+            )
+            frame_names.append(name)
+            del frame_np
+
+        del vr
+        return frame_names
+
+    # ------------------------------------------------------------------
+    # Single-video processing (used by sequential fallback)
+    # ------------------------------------------------------------------
+
     def _segment_video(
         self,
         video: Video,
@@ -219,7 +546,7 @@ class PersonSegmenter:
         frame_names = self._extract_frames(video, frame_dir)
 
         # Initialize the video predictor
-        # We don't predict again people at every frame, we predict every 
+        # We don't predict again people at every frame, we predict every
         # step frames, and propagate to the remaining frames using
         # SAM2's video predictor
 
@@ -376,37 +703,9 @@ class PersonSegmenter:
 
         Returns the sorted list of file names (``"000000.jpg"``, ...).
         """
-        frame_dir.mkdir(parents=True, exist_ok=True)
-
-        # Re-use already extracted frames if present.
-        existing = sorted(
-            p.name for p in frame_dir.iterdir()
-            if p.suffix.lower() in (".jpg", ".jpeg")
+        return self._extract_frames_from_path(
+            str(video.path), video.video_id, frame_dir
         )
-        if existing:
-            print(f"  Reusing {len(existing)} existing frames in {frame_dir}")
-            return existing
-
-        frame_names: list[str] = []
-        vr = video._make_reader()
-        total = len(vr)
-
-        for idx in tqdm(
-            range(total),
-            desc=f"  Extracting {video.video_id}",
-            leave=False,
-        ):
-            frame_np = vr[idx].asnumpy()  # (H, W, C) RGB — single frame
-            name = f"{idx:06d}.jpg"
-            cv2.imwrite(
-                str(frame_dir / name),
-                cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR),
-            )
-            frame_names.append(name)
-            del frame_np  # free immediately
-
-        del vr
-        return frame_names
 
     # ------------------------------------------------------------------
     # Cross-video appearance matching

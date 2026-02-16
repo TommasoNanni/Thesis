@@ -30,6 +30,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+import torch.multiprocessing as mp
 from tqdm import tqdm
 import smplx
 
@@ -60,6 +61,7 @@ class OneEuroFilter:
         min_cutoff: float = 1.0,
         beta: float = 0.007,
         d_cutoff: float = 1.0,
+        device: str = "cuda",
     ):
         self.min_cutoff = min_cutoff
         self.beta = beta
@@ -67,6 +69,7 @@ class OneEuroFilter:
         self._x_prev: np.ndarray | None = None
         self._dx_prev: np.ndarray | None = None
         self._t_prev: float | None = None
+        self.device = device
 
     def _smoothing_factor(self, t_e: float, cutoff: float) -> float:
         r = 2 * math.pi * cutoff * t_e
@@ -174,6 +177,7 @@ class BodyParameterEstimator:
     def _init_sam3d(self) -> None:
         """Lazy-load the SAM3D Body estimator."""
         if self._estimator is not None:
+            logging.warning("The estimator was already loaded, skipping")
             return
         try:
             from notebook.utils import setup_sam_3d_body
@@ -192,6 +196,8 @@ class BodyParameterEstimator:
     ) -> None:
         """Run SAM3D Body estimation on pre-segmented scene data.
 
+        Videos are processed in parallel across all available GPUs.
+
         Parameters
         ----------
         scene : Scene
@@ -201,12 +207,176 @@ class BodyParameterEstimator:
             :meth:`PersonSegmenter.segment_scene`).  Each directory must
             contain ``frames/``, ``json_data/``, and ``mask_data/`` subdirs.
         """
-        self._init_sam3d()
-        for video in tqdm(scene.videos, desc="SAM3D Body estimation"):
+        num_gpus = torch.cuda.device_count()
+        num_videos = len(scene.videos)
+
+        if num_gpus <= 1:
+            # Fallback: sequential on single GPU
+            self._init_sam3d()
+            for video in tqdm(scene.videos, desc="SAM3D Body estimation"):
+                video_dir = video_dirs[video.video_id]
+                self._estimate_bodies(video, video_dir)
+                gc.collect()
+                torch.cuda.empty_cache()
+            return
+
+        logging.info(f"Parallel body estimation: {num_videos} videos across {num_gpus} GPUs")
+
+        # Free main-process estimator before spawning
+        self._estimator = None
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        worker_args = []
+        for vi, video in enumerate(scene.videos):
+            gpu_id = vi % num_gpus
             video_dir = video_dirs[video.video_id]
-            self._estimate_bodies(video, video_dir)
+            worker_args.append((
+                gpu_id,
+                video.video_id,
+                str(video_dir),
+                self.sam3d_hf_repo,
+                self.sam3d_step,
+                self.smooth,
+                self.smooth_params,
+                self.bbox_padding,
+                self._PARAM_KEYS,
+                self._SMOOTH_KEYS,
+            ))
+
+        mp.set_start_method("spawn", force=True)
+        with mp.Pool(processes=min(num_gpus, num_videos)) as pool:
+            pool.starmap(BodyParameterEstimator._estimate_bodies_on_gpu, worker_args)
+
+    @staticmethod
+    def _estimate_bodies_on_gpu(
+        gpu_id: int,
+        video_id: str,
+        video_dir: str,
+        sam3d_hf_repo: str,
+        sam3d_step: int,
+        smooth: bool,
+        smooth_params: dict,
+        bbox_padding: float,
+        param_keys: tuple[str, ...],
+        smooth_keys: tuple[str, ...],
+    ) -> None:
+        """Run body estimation for one video on a specific GPU (child process).
+
+        Reads frames and metadata from disk (no Video object needed).
+        """
+        device = f"cuda:{gpu_id}"
+        torch.cuda.set_device(gpu_id)
+
+        logging.info(f"  [GPU {gpu_id}] Loading SAM3D for {video_id}")
+
+        try:
+            from notebook.utils import setup_sam_3d_body
+        except ImportError as e:
+            raise ImportError(
+                "sam-3d-body package not installed. "
+                "Please install it and ensure notebook.utils is available."
+            ) from e
+        estimator = setup_sam_3d_body(hf_repo_id=sam3d_hf_repo)
+
+        video_dir = Path(video_dir)
+        json_dir = video_dir / "json_data"
+        frame_dir = video_dir / "frames"
+        body_dir = video_dir / "body_data"
+        body_dir.mkdir(exist_ok=True)
+
+        json_files = sorted(json_dir.glob("*.json"))
+        if not json_files:
+            logging.warning(f"  [GPU {gpu_id}] {video_id}: no JSON data, skipping")
+            return
+
+        tracks: dict[int, dict[int, dict]] = {}
+
+        for json_path in tqdm(json_files, desc=f"  [GPU {gpu_id}] SAM3D {video_id}", leave=False):
+            frame_idx_str = json_path.stem.replace("mask_", "")
+            frame_idx = int(frame_idx_str)
+
+            if sam3d_step > 1 and frame_idx % sam3d_step != 0:
+                continue
+
+            with open(json_path) as f:
+                meta = json.load(f)
+
+            labels = meta.get("labels", {})
+            if not labels:
+                continue
+
+            frame_path = frame_dir / f"{frame_idx_str}.jpg"
+            if not frame_path.exists():
+                continue
+            frame_bgr = cv2.imread(str(frame_path))
+            if frame_bgr is None:
+                continue
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            img_h, img_w = frame_rgb.shape[:2]
+
+            for str_id, info in labels.items():
+                person_id = int(str_id)
+                x1, y1, x2, y2 = info["x1"], info["y1"], info["x2"], info["y2"]
+
+                bw, bh = x2 - x1, y2 - y1
+                if bw < 10 or bh < 10:
+                    continue
+
+                pad_w = int(bw * bbox_padding)
+                pad_h = int(bh * bbox_padding)
+                cx1 = max(0, x1 - pad_w)
+                cy1 = max(0, y1 - pad_h)
+                cx2 = min(img_w, x2 + pad_w)
+                cy2 = min(img_h, y2 + pad_h)
+
+                crop = frame_rgb[cy1:cy2, cx1:cx2]
+                if crop.size == 0:
+                    continue
+
+                try:
+                    outputs = estimator.process_one_image(crop)
+                except Exception as e:
+                    logging.warning(f"    [GPU {gpu_id}] SAM3D failed frame {frame_idx} person {person_id}: {e}")
+                    continue
+
+                if not outputs:
+                    continue
+
+                body = BodyParameterEstimator._match_detection(
+                    outputs, target_bbox=(x1 - cx1, y1 - cy1, x2 - cx1, y2 - cy1)
+                )
+                if body is None:
+                    continue
+
+                params = {"bbox": np.array([x1, y1, x2, y2], dtype=np.float32)}
+                for key in param_keys:
+                    if key in body:
+                        val = body[key]
+                        if isinstance(val, torch.Tensor):
+                            val = val.detach().cpu().numpy()
+                        params[key] = np.asarray(val, dtype=np.float32)
+
+                tracks.setdefault(person_id, {})[frame_idx] = params
+
+        if not tracks:
+            logging.warning(f"  [GPU {gpu_id}] {video_id}: no body detections")
+            del estimator
             gc.collect()
             torch.cuda.empty_cache()
+            return
+
+        if smooth:
+            tracks = BodyParameterEstimator._smooth_tracks_static(
+                tracks, smooth_params, smooth_keys
+            )
+
+        BodyParameterEstimator._save_body_data_static(tracks, body_dir, video_id, param_keys)
+
+        del estimator
+        gc.collect()
+        torch.cuda.empty_cache()
+        logging.info(f"  [GPU {gpu_id}] {video_id}: done")
 
     def _estimate_bodies(self, video: Video, video_dir: Path) -> None:
         """Run SAM3D Body on person crops for a single video."""
@@ -364,6 +534,15 @@ class BodyParameterEstimator:
         self, tracks: dict[int, dict[int, dict]]
     ) -> dict[int, dict[int, dict]]:
         """Apply one-euro filtering to body parameters per person."""
+        return self._smooth_tracks_static(tracks, self.smooth_params, self._SMOOTH_KEYS)
+
+    @staticmethod
+    def _smooth_tracks_static(
+        tracks: dict[int, dict[int, dict]],
+        smooth_params: dict,
+        smooth_keys: tuple[str, ...],
+    ) -> dict[int, dict[int, dict]]:
+        """Apply one-euro filtering to body parameters per person (static)."""
         for person_id, frames in tracks.items():
             if len(frames) < 3:
                 continue
@@ -383,11 +562,10 @@ class BodyParameterEstimator:
                         frames[fi]["shape_params"] = avg_shape.copy()
 
             # One-euro filter for other parameters.
-            for key in self._SMOOTH_KEYS:
+            for key in smooth_keys:
                 if key == "shape_params":
                     continue
 
-                # Check that all frames have this key.
                 vals = [frames[fi].get(key) for fi in sorted_idxs]
                 if vals[0] is None:
                     continue
@@ -397,7 +575,7 @@ class BodyParameterEstimator:
                 if not flat_vals:
                     continue
 
-                filt = OneEuroFilter(**self.smooth_params)
+                filt = OneEuroFilter(**smooth_params)
                 for i, fi in enumerate(sorted_idxs):
                     if key not in frames[fi]:
                         continue
@@ -413,6 +591,16 @@ class BodyParameterEstimator:
         video_id: str,
     ) -> None:
         """Save per-person .npz files and a summary JSON."""
+        self._save_body_data_static(tracks, body_dir, video_id, self._PARAM_KEYS)
+
+    @staticmethod
+    def _save_body_data_static(
+        tracks: dict[int, dict[int, dict]],
+        body_dir: Path,
+        video_id: str,
+        param_keys: tuple[str, ...],
+    ) -> None:
+        """Save per-person .npz files and a summary JSON (static)."""
         summary = {"video_id": video_id, "persons": {}}
 
         for person_id, frames in tracks.items():
@@ -425,12 +613,11 @@ class BodyParameterEstimator:
                 "frame_indices": np.array(sorted_idxs, dtype=np.int32),
             }
 
-            # Collect all param keys present in any frame.
             all_keys = set()
             for fi in sorted_idxs:
                 all_keys.update(frames[fi].keys())
 
-            for key in list(self._PARAM_KEYS) + ["bbox"]:
+            for key in list(param_keys) + ["bbox"]:
                 if key not in all_keys:
                     continue
                 vals = []
@@ -439,13 +626,11 @@ class BodyParameterEstimator:
                     if v is not None:
                         vals.append(v)
                     else:
-                        # Use zeros with same shape as first available.
                         ref = next(
                             (frames[fj][key] for fj in sorted_idxs if key in frames[fj]),
                             None,
                         )
                         vals.append(np.zeros_like(ref) if ref is not None else None)
-                # Filter out any remaining None.
                 if any(v is None for v in vals):
                     continue
                 arrays[key] = np.stack(vals, axis=0)
@@ -453,7 +638,6 @@ class BodyParameterEstimator:
             npz_path = body_dir / f"person_{person_id}.npz"
             np.savez(str(npz_path), **arrays)
 
-            # Summary entry.
             param_shapes = {
                 k: list(v.shape) for k, v in arrays.items()
             }
@@ -487,13 +671,13 @@ class BodyParameterEstimator:
             gender = 'neutral',
             use_pca = False,
             batch_size = 1,
-        ).to(self_device)
+        ).to(self.device)
 
         # Launch the converter
         converter = Conversion(
             mhr_model = mhr_model,
             smpl_model = smplx_model,
-            method = "pytorch",
+            method = "pytorch", # The alternative is pymomentum
         )
 
         results = converter.convert_sam3d_output_to_smpl(
