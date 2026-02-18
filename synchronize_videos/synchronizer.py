@@ -116,7 +116,7 @@ class Synchronizer:
             path.append((i, j))
         return torch.tensor(path[::-1], device=dtw.device) # Reverse it so that it is useful for later
 
-    def estimate_couple_offset(
+    def _estimate_single_person_offset(
         self,
         body_joints_1: torch.Tensor,  # T1 x J x 3
         body_joints_2: torch.Tensor,  # T2 x J x 3
@@ -125,7 +125,7 @@ class Synchronizer:
     ) -> float:
         """
         Returns the estimated temporal offset (in frames) between sequence 2
-        and sequence 1, i.e.  offset ≈ t_start_2 - t_start_1.
+        and sequence 1 for a single person, i.e.  offset ≈ t_start_2 - t_start_1.
         """
         assert body_joints_1.shape[1:] == body_joints_2.shape[1:], "Joint shapes must match"
         assert confidences_1.shape[1] == confidences_2.shape[1], "Joint count must match in confidences"
@@ -143,10 +143,41 @@ class Synchronizer:
         offset = torch.mode(shifts).values.item()
         return offset
 
+    def estimate_couple_offset(
+        self,
+        body_joints_1: list[torch.Tensor],  # P elements, each T1 x J x 3
+        body_joints_2: list[torch.Tensor],  # P elements, each T2 x J x 3
+        confidences_1: list[torch.Tensor],  # P elements, each T1 x J
+        confidences_2: list[torch.Tensor],  # P elements, each T2 x J
+    ) -> float:
+        """
+        Returns the estimated temporal offset (in frames) between sequence 2
+        and sequence 1, i.e.  offset ≈ t_start_2 - t_start_1.
+
+        Computes a per-person DTW offset and returns the median across people,
+        which is robust to outliers from mismatched or poorly tracked individuals.
+        """
+        P = len(body_joints_1)
+        assert P == len(body_joints_2) == len(confidences_1) == len(confidences_2), \
+            "Number of people must match across both videos and their confidences"
+        assert P > 0, "Need at least one person"
+
+        per_person_offsets = []
+        for p in range(P):
+            off = self._estimate_single_person_offset(
+                body_joints_1[p], body_joints_2[p],
+                confidences_1[p], confidences_2[p],
+            )
+            per_person_offsets.append(off)
+
+        # Use median for robustness against outlier persons
+        median_offset = torch.median(torch.tensor(per_person_offsets, dtype=torch.float32)).item()
+        return median_offset
+
     def estimate_offset_matrix(
         self,
-        body_joints_list: list[torch.Tensor],  # K elements, each T_i x J x 3
-        confidences_list: list[torch.Tensor],  # K elements, each T_i x J
+        body_joints_list: list[list[torch.Tensor]],  # K videos, each containing P person tensors of shape T_i x J x 3
+        confidences_list: list[list[torch.Tensor]],  # K videos, each containing P person tensors of shape T_i x J
     ) -> torch.Tensor:
 
         K = len(body_joints_list)

@@ -92,9 +92,9 @@ def main(args):
     for scene in tqdm(dataset.scenes, desc="Synchronizing scenes"):
         video_dir_dict = scene_directories[scene.scene_id]
 
-        # Load per-video joints and confidences for a chosen person
+        # Load per-video joints and confidences for all people
         body_joints_list, confidences_list = load_body_data(
-            scene, video_dir_dict, person_id=0, device=args.device,
+            scene, video_dir_dict, device=args.device,
         )
         if len(body_joints_list) < 2:
             logging.warning(f"Scene {scene.scene_id}: fewer than 2 videos with body data, skipping")

@@ -3,6 +3,7 @@ Tests for the temporal synchronizer.
 
 Generates random joint sequences, shifts them by known offsets,
 and verifies the synchronizer recovers the correct alignment.
+Supports both single-person and multi-person scenarios.
 """
 
 import sys
@@ -53,7 +54,7 @@ def shift_sequence(
 
 
 # ------------------------------------------------------------------ #
-#  Pair-wise offset recovery (no noise)
+#  Pair-wise offset recovery (no noise, single person)
 # ------------------------------------------------------------------ #
 
 class TestPairOffsetClean:
@@ -77,14 +78,15 @@ class TestPairOffsetClean:
         conf1 = torch.ones(seq1.shape[0], J, device=DEVICE)
         conf2 = torch.ones(seq2.shape[0], J, device=DEVICE)
 
-        estimated = sync.estimate_couple_offset(seq1, seq2, conf1, conf2)
+        # Wrap in lists (1 person)
+        estimated = sync.estimate_couple_offset([seq1], [seq2], [conf1], [conf2])
         assert estimated == pytest.approx(true_offset, abs=1), (
             f"Expected offset {true_offset}, got {estimated}"
         )
 
 
 # ------------------------------------------------------------------ #
-#  Multi-camera global alignment (no noise)
+#  Multi-camera global alignment (no noise, single person)
 # ------------------------------------------------------------------ #
 
 class TestGlobalAlignmentClean:
@@ -105,8 +107,8 @@ class TestGlobalAlignmentClean:
         joints, confs = [], []
         for s in true_starts:
             seq = shift_sequence(base, s, total_len).to(DEVICE)
-            joints.append(seq)
-            confs.append(torch.ones(seq.shape[0], J, device=DEVICE))
+            joints.append([seq])  # 1 person per video
+            confs.append([torch.ones(seq.shape[0], J, device=DEVICE)])
 
         offset_mat = sync.estimate_offset_matrix(joints, confs)
         estimated = sync.estimate_initial_times(offset_mat)
@@ -131,8 +133,8 @@ class TestGlobalAlignmentClean:
         joints, confs = [], []
         for s in true_starts:
             seq = shift_sequence(base, s, total_len).to(DEVICE)
-            joints.append(seq)
-            confs.append(torch.ones(seq.shape[0], J, device=DEVICE))
+            joints.append([seq])
+            confs.append([torch.ones(seq.shape[0], J, device=DEVICE)])
 
         offset_mat = sync.estimate_offset_matrix(joints, confs)
         estimated = sync.estimate_initial_times(offset_mat)
@@ -147,7 +149,7 @@ class TestGlobalAlignmentClean:
 
 
 # ------------------------------------------------------------------ #
-#  Pair-wise offset recovery WITH noise
+#  Pair-wise offset recovery WITH noise (single person)
 # ------------------------------------------------------------------ #
 
 class TestPairOffsetNoisy:
@@ -181,14 +183,14 @@ class TestPairOffsetNoisy:
         conf1 = torch.ones(seq1.shape[0], J, device=DEVICE)
         conf2 = torch.ones(seq2.shape[0], J, device=DEVICE)
 
-        estimated = sync.estimate_couple_offset(seq1, seq2, conf1, conf2)
+        estimated = sync.estimate_couple_offset([seq1], [seq2], [conf1], [conf2])
         assert estimated == pytest.approx(true_offset, abs=2), (
             f"Expected offset {true_offset}, got {estimated} (noise_std={noise_std})"
         )
 
 
 # ------------------------------------------------------------------ #
-#  Multi-camera global alignment WITH noise
+#  Multi-camera global alignment WITH noise (single person)
 # ------------------------------------------------------------------ #
 
 class TestGlobalAlignmentNoisy:
@@ -212,8 +214,8 @@ class TestGlobalAlignmentNoisy:
             seq = shift_sequence(base, s, total_len)
             torch.manual_seed(300 + idx)
             seq = seq + torch.randn(seq.shape) * noise_std
-            joints.append(seq.to(DEVICE))
-            confs.append(torch.ones(seq.shape[0], J, device=DEVICE))
+            joints.append([seq.to(DEVICE)])
+            confs.append([torch.ones(seq.shape[0], J, device=DEVICE)])
 
         offset_mat = sync.estimate_offset_matrix(joints, confs)
         estimated = sync.estimate_initial_times(offset_mat)
@@ -246,8 +248,8 @@ class TestGlobalAlignmentNoisy:
             gen_conf = torch.Generator().manual_seed(500 + idx)
             conf = 0.3 + 0.7 * torch.rand(seq.shape[0], J, generator=gen_conf)
 
-            joints.append(seq.to(DEVICE))
-            confs.append(conf.to(DEVICE))
+            joints.append([seq.to(DEVICE)])
+            confs.append([conf.to(DEVICE)])
 
         offset_mat = sync.estimate_offset_matrix(joints, confs)
         estimated = sync.estimate_initial_times(offset_mat)
@@ -258,6 +260,118 @@ class TestGlobalAlignmentNoisy:
         torch.testing.assert_close(
             estimated, true_t, atol=3, rtol=0,
             msg=f"Noisy+conf start times mismatch: estimated {estimated.tolist()} vs true {true_t.tolist()}",
+        )
+
+
+# ------------------------------------------------------------------ #
+#  Multi-person pair-wise offset recovery
+# ------------------------------------------------------------------ #
+
+class TestMultiPersonPairOffset:
+    """Recover the offset using multiple people visible in both videos."""
+
+    @pytest.fixture
+    def sync(self):
+        return Synchronizer(device=DEVICE)
+
+    @pytest.mark.parametrize("true_offset", [0, 5, -4, 12])
+    def test_two_people_clean(self, sync, true_offset):
+        """Two people, no noise — both should agree on the offset."""
+        J = 22
+        T_base = 60
+        total_len = T_base + abs(true_offset) + 10
+
+        person_seqs_1, person_seqs_2 = [], []
+        person_confs_1, person_confs_2 = [], []
+        for p in range(2):
+            base = make_random_sequence(T_base, J, seed=42 + p * 17)
+            s1 = shift_sequence(base, 0, total_len).to(DEVICE)
+            s2 = shift_sequence(base, true_offset, total_len).to(DEVICE)
+            person_seqs_1.append(s1)
+            person_seqs_2.append(s2)
+            person_confs_1.append(torch.ones(s1.shape[0], J, device=DEVICE))
+            person_confs_2.append(torch.ones(s2.shape[0], J, device=DEVICE))
+
+        estimated = sync.estimate_couple_offset(
+            person_seqs_1, person_seqs_2, person_confs_1, person_confs_2
+        )
+        assert estimated == pytest.approx(true_offset, abs=1), (
+            f"Expected offset {true_offset}, got {estimated}"
+        )
+
+    def test_three_people_noisy_median_robustness(self, sync):
+        """Three people with noise — median should still recover the offset."""
+        J = 22
+        T_base = 80
+        true_offset = 8
+        noise_std = 0.04
+        total_len = T_base + abs(true_offset) + 10
+
+        person_seqs_1, person_seqs_2 = [], []
+        person_confs_1, person_confs_2 = [], []
+        for p in range(3):
+            base = make_random_sequence(T_base, J, seed=10 + p * 31)
+            s1 = shift_sequence(base, 0, total_len)
+            s2 = shift_sequence(base, true_offset, total_len)
+            torch.manual_seed(600 + p)
+            s1 = s1 + torch.randn(s1.shape) * noise_std
+            torch.manual_seed(700 + p)
+            s2 = s2 + torch.randn(s2.shape) * noise_std
+
+            person_seqs_1.append(s1.to(DEVICE))
+            person_seqs_2.append(s2.to(DEVICE))
+            person_confs_1.append(torch.ones(s1.shape[0], J, device=DEVICE))
+            person_confs_2.append(torch.ones(s2.shape[0], J, device=DEVICE))
+
+        estimated = sync.estimate_couple_offset(
+            person_seqs_1, person_seqs_2, person_confs_1, person_confs_2
+        )
+        assert estimated == pytest.approx(true_offset, abs=2), (
+            f"Expected offset {true_offset}, got {estimated}"
+        )
+
+
+# ------------------------------------------------------------------ #
+#  Multi-person multi-camera global alignment
+# ------------------------------------------------------------------ #
+
+class TestMultiPersonGlobalAlignment:
+    """Recover global start times with multiple people per video."""
+
+    @pytest.fixture
+    def sync(self):
+        return Synchronizer(device=DEVICE)
+
+    def test_three_cameras_two_people(self, sync):
+        J = 22
+        T_base = 80
+        true_starts = [0, 6, 14]
+        num_people = 2
+        total_len = T_base + max(true_starts) + 5
+
+        # Generate one base sequence per person
+        bases = [make_random_sequence(T_base, J, seed=42 + p * 13) for p in range(num_people)]
+
+        joints, confs = [], []
+        for s in true_starts:
+            per_person_joints = []
+            per_person_confs = []
+            for p in range(num_people):
+                seq = shift_sequence(bases[p], s, total_len).to(DEVICE)
+                per_person_joints.append(seq)
+                per_person_confs.append(torch.ones(seq.shape[0], J, device=DEVICE))
+            joints.append(per_person_joints)
+            confs.append(per_person_confs)
+
+        offset_mat = sync.estimate_offset_matrix(joints, confs)
+        estimated = sync.estimate_initial_times(offset_mat)
+
+        true_t = torch.tensor(true_starts, dtype=torch.float32, device=DEVICE)
+        true_t = true_t - true_t.min()
+
+        torch.testing.assert_close(
+            estimated, true_t, atol=2, rtol=0,
+            msg=f"Start times mismatch: estimated {estimated.tolist()} vs true {true_t.tolist()}",
         )
 
 

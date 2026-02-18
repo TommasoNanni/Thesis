@@ -11,7 +11,7 @@ Output layout for each scene::
         <scene_id>/
             <video_id>/
                 frames/          extracted JPEGs (can be cleaned up)
-                mask_data/       .npy uint16 masks  (pixel value = person ID)
+                mask_data.npz    compressed mask archive (uint16, pixel value = person ID)
                 json_data/       .json per-frame instance metadata
                 result/          (optional) annotated visualisation frames
                 segmentation.mp4 (optional) visualisation video
@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import copy
 import gc
+import io
 import json
 import shutil
+import zipfile
 from pathlib import Path
 
 import cv2
@@ -218,7 +220,11 @@ class PersonSegmenter:
         for r in results:
             video_results[r["video_id"]] = r
 
-        # --- cross-video ID matching ---
+        # --- compact per-frame .npy files into a single compressed .npz ---
+        for video in scene.videos:
+            PersonSegmenter._compact_mask_data(scene_dir / video.video_id)
+
+        # --- cross-video ID matching (reads from .npz) ---
         if match_across_videos and len(scene.videos) > 1:
             id_mapping = self._match_across_videos(
                 scene, video_results, scene_dir
@@ -226,7 +232,7 @@ class PersonSegmenter:
             if id_mapping:
                 self._apply_id_mapping(id_mapping, scene_dir, scene)
 
-        # --- optional visualisation ---
+        # --- optional visualisation (unpacks .npz temporarily) ---
         if vis:
             for video in scene.videos:
                 self._visualize(video, scene_dir / video.video_id)
@@ -273,6 +279,10 @@ class PersonSegmenter:
             del result
             gc.collect()
             torch.cuda.empty_cache()
+
+        # --- compact per-frame .npy files into a single compressed .npz ---
+        for video in scene.videos:
+            PersonSegmenter._compact_mask_data(scene_dir / video.video_id)
 
         if match_across_videos and len(scene.videos) > 1:
             id_mapping = self._match_across_videos(
@@ -708,6 +718,32 @@ class PersonSegmenter:
         )
 
     # ------------------------------------------------------------------
+    # NPZ helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load_mask_from_npz(npz_path: Path, frame_stem: str) -> np.ndarray | None:
+        """Load a single frame's mask array from a mask_data.npz file.
+
+        Parameters
+        ----------
+        npz_path : Path
+            Path to the ``mask_data.npz`` archive.
+        frame_stem : str
+            The key inside the archive, e.g. ``"mask_000042"``.
+
+        Returns ``None`` if the archive or the key does not exist.
+        """
+        if not npz_path.exists():
+            return None
+        with zipfile.ZipFile(str(npz_path), "r") as zf:
+            key = frame_stem + ".npy"
+            if key not in zf.namelist():
+                return None
+            with zf.open(key) as f:
+                return np.load(io.BytesIO(f.read()))
+
+    # ------------------------------------------------------------------
     # Cross-video appearance matching
     # ------------------------------------------------------------------
 
@@ -731,8 +767,8 @@ class PersonSegmenter:
             vid_id = video.video_id
             res = video_results[vid_id]
             json_dir = Path(res["json_data_dir"])
-            mask_dir = Path(res["mask_data_dir"])
             frame_dir = Path(res["frame_dir"])
+            npz_path = Path(res["json_data_dir"]).parent / "mask_data.npz"
 
             json_files = sorted(json_dir.glob("*.json"))
             if not json_files:
@@ -742,10 +778,9 @@ class PersonSegmenter:
             with open(mid_json) as f:
                 meta = json.load(f)
 
-            mask_path = mask_dir / (mid_json.stem + ".npy")
-            if not mask_path.exists():
+            mask_img = PersonSegmenter._load_mask_from_npz(npz_path, mid_json.stem)
+            if mask_img is None:
                 continue
-            mask_img = np.load(str(mask_path))
 
             frame_idx_str = mid_json.stem.replace("mask_", "")
             frame_path = frame_dir / f"{frame_idx_str}.jpg"
@@ -849,25 +884,39 @@ class PersonSegmenter:
         scene_dir: Path,
         scene: Scene,
     ) -> None:
-        """Rewrite saved .npy masks and .json metadata with unified IDs."""
+        """Rewrite mask_data.npz and .json metadata with unified IDs."""
         for video in scene.videos:
             vid_id = video.video_id
             mapping = id_mapping.get(vid_id)
             if mapping is None or all(k == v for k, v in mapping.items()):
                 continue
 
-            mask_dir = scene_dir / vid_id / "mask_data"
+            npz_path = scene_dir / vid_id / "mask_data.npz"
             json_dir = scene_dir / vid_id / "json_data"
 
-            for mask_path in sorted(mask_dir.glob("*.npy")):
-                mask_img = np.load(str(mask_path))
-                new_mask = np.zeros_like(mask_img)
-                for old_id, new_id in mapping.items():
-                    new_mask[mask_img == old_id] = new_id
-                unmapped = set(np.unique(mask_img)) - {0} - set(mapping.keys())
-                for uid in unmapped:
-                    new_mask[mask_img == uid] = uid
-                np.save(str(mask_path), new_mask)
+            # Stream-remap every frame in the archive without loading all into RAM.
+            if npz_path.exists():
+                tmp_path = npz_path.with_suffix(".tmp.npz")
+                with (
+                    zipfile.ZipFile(str(npz_path), "r") as zf_in,
+                    zipfile.ZipFile(
+                        str(tmp_path), "w",
+                        compression=zipfile.ZIP_DEFLATED, compresslevel=6,
+                    ) as zf_out,
+                ):
+                    for name in sorted(zf_in.namelist()):
+                        with zf_in.open(name) as f:
+                            mask_img = np.load(io.BytesIO(f.read()))
+                        new_mask = np.zeros_like(mask_img)
+                        for old_id, new_id in mapping.items():
+                            new_mask[mask_img == old_id] = new_id
+                        unmapped = set(np.unique(mask_img)) - {0} - set(mapping.keys())
+                        for uid in unmapped:
+                            new_mask[mask_img == uid] = uid
+                        buf = io.BytesIO()
+                        np.save(buf, new_mask)
+                        zf_out.writestr(name, buf.getvalue())
+                tmp_path.replace(npz_path)
 
             for json_path in sorted(json_dir.glob("*.json")):
                 with open(json_path) as f:
@@ -886,20 +935,82 @@ class PersonSegmenter:
         print("Cross-video ID remapping applied.")
 
     # ------------------------------------------------------------------
+    # Mask compaction
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compact_mask_data(video_dir: Path) -> None:
+        """Merge per-frame .npy masks into one compressed .npz, then delete the folder.
+
+        Replaces ``mask_data/*.npy`` (one uncompressed file per frame) with a
+        single ``mask_data.npz`` whose keys are the original file stems
+        (e.g. ``"mask_000000"``).  For sparse uint16 masks the compression
+        ratio is typically 20-50x.
+
+        Must be called **after** cross-video ID remapping and visualisation,
+        since those steps still read the individual .npy files.
+        """
+        mask_data_dir = video_dir / "mask_data"
+        if not mask_data_dir.exists():
+            return
+
+        npy_files = sorted(mask_data_dir.glob("*.npy"))
+        if not npy_files:
+            shutil.rmtree(str(mask_data_dir))
+            return
+
+        original_mb = sum(f.stat().st_size for f in npy_files) / 1024 / 1024
+        npz_path = video_dir / "mask_data.npz"
+
+        with zipfile.ZipFile(str(npz_path), "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            for f in npy_files:
+                arr = np.load(str(f))
+                buf = io.BytesIO()
+                np.save(buf, arr)
+                zf.writestr(f.stem + ".npy", buf.getvalue())
+
+        shutil.rmtree(str(mask_data_dir))
+
+        compressed_mb = npz_path.stat().st_size / 1024 / 1024
+        print(
+            f"  mask_data: {len(npy_files)} .npy files, {original_mb:.0f} MB"
+            f" → mask_data.npz {compressed_mb:.0f} MB"
+            f" ({100 * compressed_mb / original_mb:.0f}% of original)"
+        )
+
+    # ------------------------------------------------------------------
     # Visualisation
     # ------------------------------------------------------------------
 
     def _visualize(self, video: Video, video_dir: Path) -> None:
-        """Render annotated frames and encode an mp4."""
+        """Render annotated frames and encode an mp4.
+
+        Temporarily unpacks ``mask_data.npz`` into a ``mask_data/`` directory
+        so the visualisation utility can read individual frame files, then
+        removes it once rendering is complete.
+        """
         frame_dir = video_dir / "frames"
-        mask_dir = video_dir / "mask_data"
+        npz_path = video_dir / "mask_data.npz"
         json_dir = video_dir / "json_data"
         result_dir = video_dir / "result"
         result_dir.mkdir(exist_ok=True)
 
-        CommonUtils.draw_masks_and_box_with_supervision(
-            str(frame_dir), str(mask_dir), str(json_dir), str(result_dir),
-        )
+        # Unpack .npz → mask_data/ for the visualisation utility.
+        mask_dir = video_dir / "mask_data"
+        mask_dir.mkdir(exist_ok=True)
+        with zipfile.ZipFile(str(npz_path), "r") as zf:
+            for name in zf.namelist():
+                with zf.open(name) as f:
+                    arr = np.load(io.BytesIO(f.read()))
+                np.save(str(mask_dir / name), arr)
+
+        try:
+            CommonUtils.draw_masks_and_box_with_supervision(
+                str(frame_dir), str(mask_dir), str(json_dir), str(result_dir),
+            )
+        finally:
+            shutil.rmtree(str(mask_dir))
+
         out_video = video_dir / "segmentation.mp4"
         create_video_from_images(
             str(result_dir), str(out_video), frame_rate=int(video.fps),
