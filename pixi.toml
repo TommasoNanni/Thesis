@@ -29,6 +29,7 @@ groundingdino = {path = "Grounded-SAM-2/grounding_dino", editable = true}
 mhr = { path = "MHR", editable = true }
 sam-3d-body = { path = "sam-3d-body", editable = true }
 detectron2 = { git = "https://github.com/facebookresearch/detectron2.git", rev = "a1ce2f9" }
+moge = { git = "https://github.com/microsoft/MoGe.git" }
 transformers = ">=4.0"
 addict = "*"
 yapf = "*"
@@ -66,4 +67,4 @@ hatchling = ">=1.28.0, <2"
 # Run this once after `pixi install`: pixi run setup-cuda
 # Installs the CUDA 12.6 build of the SAME torch version that pymomentum depends on
 # (currently 2.7.1). Same version = ABI-compatible, so pymomentum keeps working.
-setup-cuda = "python -m pip install --force-reinstall 'torch==2.7.1+cu126' 'torchvision==0.22.1+cu126' --index-url https://download.pytorch.org/whl/cu126"
+setup-cuda = "python -m pip install --force-reinstall 'torch==2.7.1+cu128' 'torchvision==0.22.1+cu128' --index-url https://download.pytorch.org/whl/cu128"
