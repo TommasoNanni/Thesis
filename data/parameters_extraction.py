@@ -1,8 +1,7 @@
 """SAM3D Body estimation for tracked persons in multi-view scenes.
 
 Reads pre-existing segmentation output (frames, masks, JSON metadata) and
-runs per-frame 3D body model estimation via SAM3D Body, with optional
-temporal smoothing.
+runs per-frame 3D body model estimation via SAM3D Body.
 
 Expected input layout (produced by :class:`PersonSegmenter`)::
 
@@ -22,9 +21,10 @@ Output (added to existing directories)::
 from __future__ import annotations
 
 import gc
+import io
 import json
-import math
 import logging
+import zipfile
 from pathlib import Path
 
 import cv2
@@ -34,80 +34,15 @@ import torch.multiprocessing as mp
 from tqdm import tqdm
 import smplx
 
-from data.video_dataset import Scene, Video
+from data.video_dataset import Scene
 from mhr.mhr import MHR
 from conversion import Conversion
-
-
-# ======================================================================
-# One-Euro Filter for temporal smoothing
-# ======================================================================
-
-class OneEuroFilter:
-    """Attempt jitter reduction on noisy signals (standard algorithm).
-
-    Parameters
-    ----------
-    min_cutoff : float
-        Minimum cutoff frequency.  Lower = more smoothing.
-    beta : float
-        Speed coefficient.  Higher = less lag when signal changes fast.
-    d_cutoff : float
-        Cutoff frequency for the derivative filter.
-    """
-
-    def __init__(
-        self,
-        min_cutoff: float = 1.0,
-        beta: float = 0.007,
-        d_cutoff: float = 1.0,
-        device: str = "cuda",
-    ):
-        self.min_cutoff = min_cutoff
-        self.beta = beta
-        self.d_cutoff = d_cutoff
-        self._x_prev: np.ndarray | None = None
-        self._dx_prev: np.ndarray | None = None
-        self._t_prev: float | None = None
-        self.device = device
-
-    def _smoothing_factor(self, t_e: float, cutoff: float) -> float:
-        r = 2 * math.pi * cutoff * t_e
-        return r / (r + 1)
-
-    def __call__(self, t: float, x: np.ndarray) -> np.ndarray:
-        if self._t_prev is None:
-            self._x_prev = x.copy()
-            self._dx_prev = np.zeros_like(x)
-            self._t_prev = t
-            return x.copy()
-
-        t_e = t - self._t_prev
-        if t_e <= 0:
-            return self._x_prev.copy()
-
-        # Derivative estimation.
-        a_d = self._smoothing_factor(t_e, self.d_cutoff)
-        dx = (x - self._x_prev) / t_e
-        dx_hat = a_d * dx + (1 - a_d) * self._dx_prev
-
-        # Adaptive cutoff.
-        cutoff = self.min_cutoff + self.beta * np.abs(dx_hat)
-        a = self._smoothing_factor(t_e, cutoff)
-        x_hat = a * x + (1 - a) * self._x_prev
-
-        self._x_prev = x_hat
-        self._dx_prev = dx_hat
-        self._t_prev = t
-        return x_hat
-
 
 class BodyParameterEstimator:
     """Estimate 3D body parameters for tracked persons.
 
     Reads pre-existing segmentation output and runs SAM3D Body on each
-    detected person crop, with optional temporal smoothing via one-euro
-    filtering.  Does **not** perform segmentation itself.
+    detected person crop.  Does **not** perform segmentation itself.
 
     Parameters
     ----------
@@ -115,10 +50,6 @@ class BodyParameterEstimator:
         HuggingFace repo ID for SAM3D Body model.
     sam3d_step : int
         Run SAM3D every *sam3d_step* frames (1 = every frame).
-    smooth : bool
-        Whether to apply temporal smoothing to body parameters.
-    smooth_params : dict | None
-        One-euro filter parameters: ``{min_cutoff, beta, d_cutoff}``.
     bbox_padding : float
         Fractional padding around bounding boxes before passing to SAM3D.
     """
@@ -137,47 +68,32 @@ class BodyParameterEstimator:
         "focal_length",
     )
 
-    # Keys to smooth (shape is averaged, not smoothed).
-    _SMOOTH_KEYS = (
-        "pred_keypoints_3d",
-        "pred_keypoints_2d",
-        "pred_vertices",
-        "pred_cam_t",
-        "body_pose_params",
-        "hand_pose_params",
-        "global_rot",
-        "scale_params",
-    )
+    # Re-identification: minimum cosine similarity to merge a new SAM2 track
+    # into an existing person, and EMA weight for updating gallery features.
+    _REID_THRESHOLD: float = 0.85
+    _GALLERY_EMA_ALPHA: float = 0.9
 
     def __init__(
         self,
         sam3d_hf_repo: str = "facebook/sam-3d-body-dinov3",
         sam3d_step: int = 1,
-        smooth: bool = False,
-        smooth_params: dict | None = None,
         bbox_padding: float = 0.2,
         smplx_model_path: str | None = None,
         mhr_model_path: str | None = None,
     ):
         self.sam3d_hf_repo = sam3d_hf_repo
         self.sam3d_step = sam3d_step
-        self.smooth = smooth
-        self.smooth_params = smooth_params or {
-            "min_cutoff": 1.0,
-            "beta": 0.007,
-            "d_cutoff": 1.0,
-        }
         self.bbox_padding = bbox_padding
         self.smplx_model_path = smplx_model_path
         self.mhr_model_path = mhr_model_path
 
-        self._estimator = None
-        self._converter = None
+        self._estimator: object | None = None
+        self._converter: object | None = None
 
     def _init_sam3d(self) -> None:
         """Lazy-load the SAM3D Body estimator."""
         if self._estimator is not None:
-            logging.warning("The estimator was already loaded, skipping")
+            logging.warning("The estimator was already loaded, skipping the loading")
             return
         try:
             from notebook.utils import setup_sam_3d_body
@@ -205,8 +121,8 @@ class BodyParameterEstimator:
             The scene whose videos to process.
         video_dirs : dict[str, Path]
             Mapping of ``video_id`` -> output directory (as returned by
-            :meth:`PersonSegmenter.segment_scene`).  Each directory must
-            contain ``frames/``, ``json_data/``, and ``mask_data/`` subdirs.
+            `PersonSegmenter.segment_scene`).  Each directory must
+            contain ``frames/``, ``json_data/`` directories and a mask_data.npz file.
         """
         num_gpus = torch.cuda.device_count()
         num_videos = len(scene.videos)
@@ -221,11 +137,8 @@ class BodyParameterEstimator:
                     video.video_id,
                     str(video_dir),
                     self.sam3d_step,
-                    self.smooth,
-                    self.smooth_params,
                     self.bbox_padding,
                     self._PARAM_KEYS,
-                    self._SMOOTH_KEYS,
                 )
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -250,6 +163,7 @@ class BodyParameterEstimator:
 
         processes = []
         for gpu_id in range(num_workers):
+            # Launch processes in parallel on the available GPUs
             p = mp.Process(
                 target=BodyParameterEstimator._gpu_worker,
                 args=(
@@ -257,11 +171,8 @@ class BodyParameterEstimator:
                     task_queue,
                     self.sam3d_hf_repo,
                     self.sam3d_step,
-                    self.smooth,
-                    self.smooth_params,
                     self.bbox_padding,
                     self._PARAM_KEYS,
-                    self._SMOOTH_KEYS,
                 ),
             )
             p.start()
@@ -276,11 +187,8 @@ class BodyParameterEstimator:
         task_queue: mp.Queue,
         sam3d_hf_repo: str,
         sam3d_step: int,
-        smooth: bool,
-        smooth_params: dict,
         bbox_padding: float,
         param_keys: tuple[str, ...],
-        smooth_keys: tuple[str, ...],
     ) -> None:
         """Worker process: load SAM3D once, then consume videos from the queue.
 
@@ -300,6 +208,7 @@ class BodyParameterEstimator:
         estimator = setup_sam_3d_body(hf_repo_id=sam3d_hf_repo)
         logging.info(f"{gpu_label}SAM3D loaded.")
 
+        # finish the queue, until a None trigger is hit
         while True:
             task = task_queue.get()  # blocks until a task is available
             if task is None:
@@ -313,11 +222,8 @@ class BodyParameterEstimator:
                     video_id,
                     video_dir,
                     sam3d_step,
-                    smooth,
-                    smooth_params,
                     bbox_padding,
                     param_keys,
-                    smooth_keys,
                     gpu_label=gpu_label,
                 )
             except Exception as e:
@@ -337,11 +243,8 @@ class BodyParameterEstimator:
         video_id: str,
         video_dir: str,
         sam3d_step: int,
-        smooth: bool,
-        smooth_params: dict,
         bbox_padding: float,
         param_keys: tuple[str, ...],
-        smooth_keys: tuple[str, ...],
         gpu_label: str = "",
     ) -> None:
         """Process all frames of one video with batched per-frame inference.
@@ -349,10 +252,12 @@ class BodyParameterEstimator:
         All persons detected in a single frame are forwarded through SAM3D in
         one call.
         """
-        video_dir = Path(video_dir)
-        json_dir = video_dir / "json_data"
-        frame_dir = video_dir / "frames"
-        body_dir = video_dir / "body_data"
+
+        # create the output directories
+        video_path = Path(video_dir)
+        json_dir = video_path / "json_data"
+        frame_dir = video_path / "frames"
+        body_dir = video_path / "body_data"
         body_dir.mkdir(exist_ok=True)
 
         json_files = sorted(json_dir.glob("*.json"))
@@ -362,9 +267,19 @@ class BodyParameterEstimator:
 
         tracks: dict[int, dict[int, dict]] = {}
 
+        # Gallery for visual re-identification across SAM2 track interruptions.
+        # person_gallery: canonical_id → L2-normalised appearance descriptor (EMA).
+        # id_remap: raw SAM2 id → canonical_id for ids that were re-identified.
+        # We employ DINOv3 backbone (given by SAM 3D) in order to match people across
+        # frames using cosine similarity between visual features
+        person_gallery: dict[int, np.ndarray] = {}
+        id_remap: dict[int, int] = {}
+
         for json_path in tqdm(
             json_files, desc=f"{gpu_label}SAM3D {video_id}", leave=False
         ):
+            # Load frame idx and bounding boxes
+
             frame_idx_str = json_path.stem.replace("mask_", "")
             frame_idx = int(frame_idx_str)
 
@@ -414,24 +329,56 @@ class BodyParameterEstimator:
 
             # Single batched forward pass for all persons in this frame.
             bboxes_arr = np.array(
-                [[p[1], p[2], p[3], p[4]] for p in valid_persons],
+                [[p[1], p[2], p[3], p[4]] for p in valid_persons], # pass the bbox coordinates
                 dtype=np.float32,
             )
+
+            # Hook into the backbone to capture visual features for re-ID.
+            # The backbone runs first for the body pass (N_persons crops); we only
+            # want that first call — hand passes use different crops.
+            # This will allow us to keep track of the visual features
+            _hook_feats: list[np.ndarray] = []
+
+            def _backbone_hook(_module, _input, output):
+                if _hook_feats:   # ignore subsequent hand-branch calls
+                    return
+                emb = output[-1] if isinstance(output, tuple) else output
+                # Global-average-pool: (N, C, H, W) → (N, C), then L2-normalise.
+                feat = emb.float().mean(dim=(-2, -1))
+                feat = feat / feat.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                _hook_feats.append(feat.detach().cpu().numpy())
+
+            try:
+                _hook_handle = estimator.model.backbone.register_forward_hook(
+                    _backbone_hook
+                )
+            except AttributeError:
+                logging.error("estimator  doesn't have a model.backbone.register_forward_hook method")
+                _hook_handle = None
+
             try:
                 outputs = estimator.process_one_image(
                     frame_rgb, bboxes=bboxes_arr
                 )
             except Exception as e:
                 logging.warning(
-                    f"{gpu_label}SAM3D failed frame {frame_idx} in {video_id}: {e}"
+                    f"{gpu_label}SAM3D failed frame {frame_idx} in {video_id}: {e}, returning None"
                 )
-                continue
+                outputs = None
+            finally:
+                # FInally free the hook
+                if _hook_handle is not None:
+                    _hook_handle.remove()
 
             if not outputs:
-                logging.warning(
-                    f"{gpu_label}No outputs for frame {frame_idx} in {video_id}"
-                )
+                if outputs is not None:
+                    logging.warning(
+                        f"{gpu_label}No outputs for frame {frame_idx} in {video_id}"
+                    )
                 continue
+
+            # vis_feats[i] is the L2-normalised backbone descriptor for valid_persons[i].
+            vis_feats: np.ndarray | None = _hook_feats[0] if _hook_feats else None
 
             # outputs[i] corresponds to valid_persons[i] (same order as bboxes_arr).
             for i, (person_id, _, _, _, _, x1, y1, x2, y2) in enumerate(
@@ -443,6 +390,45 @@ class BodyParameterEstimator:
                 if body is None:
                     continue
 
+                # Visual re-identification
+                feat_i = (
+                    vis_feats[i]
+                    if vis_feats is not None and i < len(vis_feats)
+                    else None
+                )
+                canonical_id: int = id_remap.get(person_id, person_id)
+
+                if feat_i is not None:
+                    if person_id not in person_gallery and person_id not in id_remap:
+                        # Brand-new SAM2 track — check whether this person was seen
+                        # before under a different ID (e.g. after occlusion).
+                        if person_gallery:
+                            sims = {
+                                pid: float(np.dot(feat_i, gfeat))
+                                for pid, gfeat in person_gallery.items()
+                            }
+                            best_id = max(sims, key=lambda pid: sims[pid])
+                            # If the person is above a certain similarity with another person, then match
+                            if sims[best_id] >= BodyParameterEstimator._REID_THRESHOLD:
+                                id_remap[person_id] = best_id
+                                canonical_id = best_id
+                                logging.info(
+                                    f"{gpu_label}Re-ID: SAM2 id {person_id} → "
+                                    f"person {best_id} (sim={sims[best_id]:.3f}) "
+                                    f"in {video_id} frame {frame_idx}"
+                                )
+                            else:
+                                person_gallery[person_id] = feat_i.copy()
+                        else:
+                            person_gallery[person_id] = feat_i.copy()
+
+                    # Update gallery descriptor with EMA for the canonical person.
+                    if canonical_id in person_gallery:
+                        alpha = BodyParameterEstimator._GALLERY_EMA_ALPHA
+                        g = alpha * person_gallery[canonical_id] + (1 - alpha) * feat_i
+                        norm = np.linalg.norm(g)
+                        person_gallery[canonical_id] = g / norm if norm > 0 else g
+
                 params = {"bbox": np.array([x1, y1, x2, y2], dtype=np.float32)}
                 for key in param_keys:
                     if key in body:
@@ -451,88 +437,29 @@ class BodyParameterEstimator:
                             val = val.detach().cpu().numpy()
                         params[key] = np.asarray(val, dtype=np.float32)
 
-                tracks.setdefault(person_id, {})[frame_idx] = params
+                tracks.setdefault(canonical_id, {})[frame_idx] = params
 
         if not tracks:
             logging.warning(f"{gpu_label}{video_id}: no body detections")
             return
 
-        if smooth:
-            tracks = BodyParameterEstimator._smooth_tracks_static(
-                tracks, smooth_params, smooth_keys
-            )
-
         BodyParameterEstimator._save_body_data_static(
             tracks, body_dir, video_id, param_keys
         )
 
-    def _estimate_bodies(self, video: Video, video_dir: Path) -> None: # UNUSED
-        """Run SAM3D Body on a single video (single-GPU convenience wrapper).""" 
-        BodyParameterEstimator._process_video_core(
-            self._estimator,
-            video.video_id,
-            str(video_dir),
-            self.sam3d_step,
-            self.smooth,
-            self.smooth_params,
-            self.bbox_padding,
-            self._PARAM_KEYS,
-            self._SMOOTH_KEYS,
-        )
-
-    @staticmethod
-    def _smooth_tracks_static(
-        tracks: dict[int, dict[int, dict]],
-        smooth_params: dict,
-        smooth_keys: tuple[str, ...],
-    ) -> dict[int, dict[int, dict]]:
-        """Apply one-euro filtering to body parameters per person (static)."""
-        for person_id, frames in tracks.items():
-            if len(frames) < 3:
-                continue
-
-            sorted_idxs = sorted(frames.keys())
-
-            # Average shape params (should be constant per person).
-            shape_vals = [
-                frames[fi]["shape_params"]
-                for fi in sorted_idxs
-                if "shape_params" in frames[fi]
-            ]
-            if shape_vals:
-                avg_shape = np.mean(shape_vals, axis=0)
-                for fi in sorted_idxs:
-                    if "shape_params" in frames[fi]:
-                        frames[fi]["shape_params"] = avg_shape.copy()
-
-            # One-euro filter for other parameters.
-            for key in smooth_keys:
-                if key == "shape_params":
-                    continue
-
-                vals = [frames[fi].get(key) for fi in sorted_idxs]
-                if vals[0] is None:
-                    continue
-
-                orig_shape = vals[0].shape
-                flat_vals = [v.flatten() for v in vals if v is not None]
-                if not flat_vals:
-                    continue
-
-                filt = OneEuroFilter(**smooth_params)
-                for i, fi in enumerate(sorted_idxs):
-                    if key not in frames[fi]:
-                        continue
-                    smoothed = filt(float(fi), flat_vals[i])
-                    frames[fi][key] = smoothed.reshape(orig_shape)
-
-        return tracks
-
-    def _smooth_tracks(
-        self, tracks: dict[int, dict[int, dict]]
-    ) -> dict[int, dict[int, dict]]:
-        """Apply one-euro filtering to body parameters per person."""
-        return self._smooth_tracks_static(tracks, self.smooth_params, self._SMOOTH_KEYS)
+        # Persist and apply the within-video re-ID mapping so that
+        # mask_data.npz and json_data/ stay consistent with body_data/.
+        if id_remap:
+            reid_path = body_dir / "reid_id_mapping.json"
+            with open(reid_path, "w") as f:
+                json.dump({str(k): v for k, v in id_remap.items()}, f, indent=2)
+            print(
+                f"  {video_id}: re-ID merged {len(id_remap)} SAM2 track(s) "
+                f"→ updating masks and JSON metadata"
+            )
+            BodyParameterEstimator._apply_reid_remap(
+                video_path, id_remap, gpu_label
+            )
 
     @staticmethod
     def _save_body_data_static(
@@ -608,6 +535,77 @@ class BodyParameterEstimator:
     ) -> None:
         """Save per-person .npz files and a summary JSON."""
         self._save_body_data_static(tracks, body_dir, video_id, self._PARAM_KEYS)
+
+    @staticmethod
+    def _apply_reid_remap(
+        video_dir: Path,
+        id_remap: dict[int, int],
+        gpu_label: str = "",
+    ) -> None:
+        """Rewrite mask_data.npz and json_data/*.json with re-identified IDs.
+
+        Uses the same stream-remap logic as PersonSegmenter._apply_id_mapping
+        so that the segmentation files stay consistent with body_data/ after
+        within-video re-identification.
+
+        Parameters
+        ----------
+        video_dir : Path
+            Root output directory for one video (contains mask_data.npz and
+            json_data/).
+        id_remap : dict[int, int]
+            Mapping of raw SAM2 ID → canonical person ID discovered during
+            body parameter estimation.
+        """
+        if not id_remap or all(k == v for k, v in id_remap.items()):
+            return
+
+        npz_path = video_dir / "mask_data.npz"
+        json_dir = video_dir / "json_data"
+
+        # Remap pixel values in the compressed mask archive
+        if npz_path.exists():
+            tmp_path = npz_path.with_suffix(".tmp.npz")
+            with (
+                zipfile.ZipFile(str(npz_path), "r") as zf_in,
+                zipfile.ZipFile(
+                    str(tmp_path), "w",
+                    compression=zipfile.ZIP_DEFLATED, compresslevel=6,
+                ) as zf_out,
+            ):
+                for name in sorted(zf_in.namelist()):
+                    with zf_in.open(name) as f:
+                        mask_img = np.load(io.BytesIO(f.read()))
+                    new_mask = np.zeros_like(mask_img)
+                    for old_id, new_id in id_remap.items():
+                        new_mask[mask_img == old_id] = new_id
+                    # IDs not in the remap keep their original value.
+                    for uid in set(np.unique(mask_img)) - {0} - set(id_remap.keys()):
+                        new_mask[mask_img == uid] = uid
+                    buf = io.BytesIO()
+                    np.save(buf, new_mask)
+                    zf_out.writestr(name, buf.getvalue())
+            tmp_path.replace(npz_path)
+
+        # Remap instance IDs in the per-frame JSON metadata 
+        for json_path in sorted(json_dir.glob("*.json")):
+            with open(json_path) as f:
+                data = json.load(f)
+            if "labels" in data:
+                new_labels = {}
+                for str_id, info in data["labels"].items():
+                    old_id = int(str_id)
+                    new_id = id_remap.get(old_id, old_id)
+                    info["instance_id"] = new_id
+                    new_labels[str(new_id)] = info
+                data["labels"] = new_labels
+            with open(json_path, "w") as f:
+                json.dump(data, f)
+
+        logging.info(
+            f"{gpu_label}Re-ID segmentation remap applied in {video_dir.name}: "
+            f"{id_remap}"
+        )
 
     def convert_hmr_to_smplx(self, sam3d_outputs):
         """Convert HMR parameters to SMPLX parameters"""

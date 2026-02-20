@@ -36,7 +36,7 @@ echo ""
 
 
 # Run via pixi (activates the correct conda env automatically)
-pixi run python -m test.test_parameters_extraction_sam3d
+pixi run python -m test.test_sam3d_reid
 
 echo ""
 echo "Done: $(date)"
