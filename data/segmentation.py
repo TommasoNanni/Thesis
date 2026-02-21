@@ -80,9 +80,9 @@ class PersonSegmenter:
         gdino_model_id: str = "IDEA-Research/grounding-dino-tiny",
         device: str = "cuda",
         text_prompt: str = "person.",
-        box_threshold: float = 0.25,
-        text_threshold: float = 0.25,
-        detection_step: int = 30,
+        box_threshold: float = 0.45,
+        text_threshold: float = 0.45,
+        detection_step: int = 15,
     ):
         self.sam2_checkpoint = sam2_checkpoint
         self.model_cfg = model_cfg
@@ -593,7 +593,7 @@ class PersonSegmenter:
 
                 objects_count = mask_dict.update_masks(
                     tracking_annotation_dict=sam2_masks,
-                    iou_threshold=0.6,
+                    iou_threshold=0.8,
                     objects_count=objects_count,
                 )
             else:

@@ -18,20 +18,34 @@ import torch.nn as nn
 from data.video_dataset import EgoExoSceneDataset
 from data.segmentation import PersonSegmenter
 from data.parameters_extraction import BodyParameterEstimator
+from configuration import CONFIG
 
 def main():
-    data_root = "/cluster/project/cvg/data/EgoExo_georgiatech/raw/takes"
-    output_dir = "/cluster/project/cvg/students/tnanni/ghost/test_outputs/segmentation_test"
+    data_root = CONFIG.data.data_root
+    output_dir = CONFIG.data.output_directory
+    scenes_slice = CONFIG.data.slice
+    exclude_ego = CONFIG.data.exclude_egocentric
 
     # Load dataset (1 scene for testing)
-    ds = EgoExoSceneDataset(data_root, slice=1)
+    ds = EgoExoSceneDataset(
+        data_root = data_root, 
+        slice=scenes_slice, 
+        exclude_ego=exclude_ego,
+    )
     scene = ds[0]
     print(f"\n=== Scene: {scene.scene_id} ({len(scene)} videos) ===")
     for v in scene:
         print(f"  {v}")
 
     # Step 1: Segment people in the scene
-    segmenter = PersonSegmenter()
+    segmenter = PersonSegmenter(
+        sam2_checkpoint=CONFIG.segmentation.sam2_checkpoint,
+        model_cfg=CONFIG.segmentation.sam2_cfg,
+        gdino_model_id=CONFIG.segmentation.gdino_id,
+        box_threshold=CONFIG.segmentation.box_threshold,
+        text_threshold=CONFIG.segmentation.text_threshold,
+        detection_step=CONFIG.segmentation.detection_step,
+    )
     print(f"\n--- Running segmentation on scene '{scene.scene_id}' ---")
     video_dirs = segmenter.segment_scene(
         scene=scene,
@@ -43,7 +57,13 @@ def main():
         print(f"  {video_id}: {vdir}")
 
     # Step 2: Estimate body parameters from segmentation output
-    estimator = BodyParameterEstimator()
+    estimator = BodyParameterEstimator(
+        sam3d_hf_repo = CONFIG.parameters_extraction.sam3d_id,
+        sam3d_step = CONFIG.parameters_extraction.sam3d_step,
+        bbox_padding = CONFIG.parameters_extraction.bbox_padding,
+        smplx_model_path = CONFIG.data.smplx_model_path,
+        mhr_model_path  = CONFIG.data.mhr_model_path,
+    )
     print(f"\n--- Running body parameter estimation ---")
     estimator.estimate_scene(
         scene=scene,

@@ -16,6 +16,7 @@ numpy = ">=1.24.4"
 tqdm = ">=4.66.1"
 pillow = ">=9.4.0"
 scikit-learn = ">=1.8.0,<2"
+pyyaml = ">=6.0.3,<7"
 
 [pypi-options]
 # SAM-2 and groundingdino import torch at build time; build them inside the

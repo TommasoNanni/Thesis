@@ -70,7 +70,7 @@ class BodyParameterEstimator:
 
     # Re-identification: minimum cosine similarity to merge a new SAM2 track
     # into an existing person, and EMA weight for updating gallery features.
-    _REID_THRESHOLD: float = 0.85
+    _REID_THRESHOLD: float = 0.75
     _GALLERY_EMA_ALPHA: float = 0.9
 
     def __init__(
